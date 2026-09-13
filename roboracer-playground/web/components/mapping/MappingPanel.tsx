@@ -41,7 +41,7 @@ export default function MappingPanel({ gw, lab }: Props) {
     controller:
       isMapControllerAlgo(gw.status.algorithm)
         ? {
-            text: `lap ${gw.telemetry.lap_count + 1} · ${gw.telemetry.lap_time.toFixed(1)} s`,
+            text: `lap ${gw.telemetry.lap_count + 1} · ${(gw.telemetry.lap_time ?? 0).toFixed(1)} s`,
             tone: "on",
           }
         : lab.selectedRaceline

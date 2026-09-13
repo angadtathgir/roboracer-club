@@ -2,13 +2,21 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { ParamsAck } from "@/lib/useGateway";
-import type { AlgorithmSpec } from "@/lib/algorithms";
+import { algorithmSpec, type AlgorithmSpec } from "@/lib/algorithms";
+import {
+  defaultAlgoParams,
+  loadAlgoParams,
+  patchAlgoParams,
+} from "@/lib/algoParams";
 
 interface Props {
   algorithm: AlgorithmSpec;
   onSetParams: (params: Record<string, number>) => void;
   lastAck: ParamsAck | null;
+  /** Grey out sliders (e.g. no websocket). Draft values still persist. */
   disabled: boolean;
+  /** When true, slider moves are sent to the running ROS node. */
+  live: boolean;
 }
 
 export default function ParamsPanel({
@@ -16,24 +24,36 @@ export default function ParamsPanel({
   onSetParams,
   lastAck,
   disabled,
+  live,
 }: Props) {
+  const algoId = algorithm.id;
+  // Defaults only on first paint so SSR and hydration match. localStorage
+  // is applied in the effect below (after mount, and when the algo changes).
   const [values, setValues] = useState<Record<string, number>>(() =>
-    Object.fromEntries(algorithm.params.map((s) => [s.name, s.default]))
+    defaultAlgoParams(algorithm)
   );
   const pending = useRef<Record<string, number>>({});
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Reset slider values when the algorithm changes.
   useEffect(() => {
-    setValues(
-      Object.fromEntries(algorithm.params.map((s) => [s.name, s.default]))
-    );
+    setValues(loadAlgoParams(algorithmSpec(algoId)));
     pending.current = {};
-  }, [algorithm]);
+  }, [algoId]);
+
+  // Don't deliver a delayed set_params after Stop.
+  useEffect(() => {
+    if (live) return;
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
+    pending.current = {};
+  }, [live]);
 
   // Debounced live send (~80ms) so sliders feel real-time without spamming.
   const queueSend = (name: string, value: number) => {
     pending.current[name] = value;
+    if (!live) return;
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => {
       onSetParams({ ...pending.current });
@@ -79,6 +99,7 @@ export default function ParamsPanel({
             onChange={(e) => {
               const v = parseFloat(e.target.value);
               setValues((prev) => ({ ...prev, [s.name]: v }));
+              patchAlgoParams(algoId, { [s.name]: v });
               queueSend(s.name, v);
             }}
           />
@@ -87,8 +108,10 @@ export default function ParamsPanel({
       {lastAck && !lastAck.ok && (
         <div className="ack fail">Rejected: {lastAck.reason}</div>
       )}
-      {disabled && (
-        <div className="ack fail">Start the algorithm to enable tuning.</div>
+      {!live && (
+        <div className="note-inline">
+          Values are kept when you stop. Start to apply them on the car.
+        </div>
       )}
     </div>
   );

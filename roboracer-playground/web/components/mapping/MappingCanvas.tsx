@@ -245,7 +245,7 @@ export default function MappingCanvas({ gw, lab }: Props) {
         debug && isMapControllerAlgo(debug.algorithm)
           ? Number(debug.s_curr)
           : null;
-      const trueSpeed = gw.telemetry.speed;
+      const trueSpeed = gw.telemetry.speed ?? 0;
       const pe = gw.telemetry.pose_error;
       return (
         <>

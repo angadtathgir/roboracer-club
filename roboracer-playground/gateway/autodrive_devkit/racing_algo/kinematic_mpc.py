@@ -55,7 +55,8 @@ def nearest_point(point, trajectory):
 class MpcConfig:
     NXK: int = 4
     NU: int = 2
-    TK: int = 8
+    # Look-ahead length in DTK steps (0.8 s at the default 8).
+    horizon_steps: int = 8
     Rk: np.ndarray = field(
         default_factory=lambda: np.diag([0.01, 100.0]))
     Rdk: np.ndarray = field(
@@ -123,7 +124,7 @@ class KMPCPlanner:
         return steer, speed
 
     def calc_ref_trajectory(self, state, cx, cy, cyaw, sp):
-        ref_traj = np.zeros((self.config.NXK, self.config.TK + 1))
+        ref_traj = np.zeros((self.config.NXK, self.config.horizon_steps + 1))
         ncourse = len(cx)
         _, _, _, ind = nearest_point(
             np.array([state.x, state.y]), np.array([cx, cy]).T)
@@ -131,7 +132,7 @@ class KMPCPlanner:
         travel = abs(state.v) * self.config.DTK
         dind = max(travel / self.config.dlk, 1e-3)
         ind_list = int(ind) + np.insert(
-            np.cumsum(np.repeat(dind, self.config.TK)), 0, 0
+            np.cumsum(np.repeat(dind, self.config.horizon_steps)), 0, 0
         ).astype(int)
         ind_list = np.mod(ind_list, ncourse)
 
@@ -153,11 +154,11 @@ class KMPCPlanner:
         return ref_traj
 
     def predict_motion(self, x0, oa, od):
-        path_predict = np.zeros((self.config.NXK, self.config.TK + 1))
+        path_predict = np.zeros((self.config.NXK, self.config.horizon_steps + 1))
         for i, _ in enumerate(x0):
             path_predict[i, 0] = x0[i]
         state = State(x=x0[0], y=x0[1], yaw=x0[3], v=x0[2])
-        for ai, di, i in zip(oa, od, range(1, self.config.TK + 1)):
+        for ai, di, i in zip(oa, od, range(1, self.config.horizon_steps + 1)):
             state = self.update_state(state, ai, di)
             path_predict[0, i] = state.x
             path_predict[1, i] = state.y
@@ -207,19 +208,19 @@ class KMPCPlanner:
 
     def mpc_prob_init_kinematic(self):
         cfg = self.config
-        self.xk = cvxpy.Variable((cfg.NXK, cfg.TK + 1))
-        self.uk = cvxpy.Variable((cfg.NU, cfg.TK))
+        self.xk = cvxpy.Variable((cfg.NXK, cfg.horizon_steps + 1))
+        self.uk = cvxpy.Variable((cfg.NU, cfg.horizon_steps))
         objective = 0.0
         constraints = []
 
         self.x0k = cvxpy.Parameter(cfg.NXK)
         self.x0k.value = np.zeros(cfg.NXK)
-        self.ref_traj_k = cvxpy.Parameter((cfg.NXK, cfg.TK + 1))
-        self.ref_traj_k.value = np.zeros((cfg.NXK, cfg.TK + 1))
+        self.ref_traj_k = cvxpy.Parameter((cfg.NXK, cfg.horizon_steps + 1))
+        self.ref_traj_k.value = np.zeros((cfg.NXK, cfg.horizon_steps + 1))
 
-        R_block = np_block_diag(*([cfg.Rk] * cfg.TK))
-        Rd_block = np_block_diag(*([cfg.Rdk] * (cfg.TK - 1)))
-        Q_list = [cfg.Qk] * cfg.TK + [cfg.Qfk]
+        R_block = np_block_diag(*([cfg.Rk] * cfg.horizon_steps))
+        Rd_block = np_block_diag(*([cfg.Rdk] * (cfg.horizon_steps - 1)))
+        Q_list = [cfg.Qk] * cfg.horizon_steps + [cfg.Qfk]
         Q_block = np_block_diag(*Q_list)
 
         objective += cvxpy.quad_form(cvxpy.vec(self.uk), R_block)
@@ -228,11 +229,11 @@ class KMPCPlanner:
         objective += cvxpy.quad_form(
             cvxpy.vec(cvxpy.diff(self.uk, axis=1)), Rd_block)
 
-        path_predict = np.zeros((cfg.NXK, cfg.TK + 1))
+        path_predict = np.zeros((cfg.NXK, cfg.horizon_steps + 1))
         A_block = []
         B_block = []
         C_block = []
-        for t in range(cfg.TK):
+        for t in range(cfg.horizon_steps):
             A, B, C = self.get_kinematic_model_matrix(
                 path_predict[2, t], path_predict[3, t], 0.0)
             A_block.append(A)
@@ -292,7 +293,7 @@ class KMPCPlanner:
         A_block = []
         B_block = []
         C_block = []
-        for t in range(cfg.TK):
+        for t in range(cfg.horizon_steps):
             A, B, C = self.get_kinematic_model_matrix(
                 path_predict[2, t], path_predict[3, t], 0.0)
             A_block.append(A)
@@ -330,8 +331,8 @@ class KMPCPlanner:
         oa = self.oa
         od = self.odelta_v
         if oa is None or od is None:
-            oa = [0.0] * self.config.TK
-            od = [0.0] * self.config.TK
+            oa = [0.0] * self.config.horizon_steps
+            od = [0.0] * self.config.horizon_steps
 
         path_predict = self.predict_motion(x0, oa, od)
         mpc_a, mpc_delta, ox, oy = self.mpc_prob_solve(

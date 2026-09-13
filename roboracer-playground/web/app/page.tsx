@@ -53,6 +53,7 @@ export default function Page() {
     trail,
     lastAck,
     sessionEpoch,
+    uiRttMs,
     setParams,
     startAlgo,
     stopAlgo,
@@ -181,7 +182,8 @@ export default function Page() {
           algorithm={activeSpec}
           onSetParams={setParams}
           lastAck={lastAck}
-          disabled={!running || !status.wsConnected}
+          disabled={!status.wsConnected}
+          live={running && status.wsConnected}
         />
       </div>
     );
@@ -298,6 +300,7 @@ export default function Page() {
             status={status}
             gatewayUrl={gatewayUrl}
             simAddress={SIM_ADDRESS}
+            uiRttMs={uiRttMs}
             onGatewayUrlChange={onGatewayUrlChange}
             onShowSetup={() => setShowSetup(true)}
           />

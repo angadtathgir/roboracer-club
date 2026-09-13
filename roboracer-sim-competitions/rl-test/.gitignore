@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+checkpoints/
+best_model/
+logs/
+advanced_checkpoints/
+advanced_best_model/
+advanced_logs/
+*.zip
+
+build/
+install/
+log/

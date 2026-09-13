@@ -1,0 +1,18 @@
+# Playground Pure Pursuit slider values for track-20260731 (31 Jul raceline).
+# Loaded by race.launch.py when controller:=pp_backup (the default).
+
+pp_backup_node:
+  ros__parameters:
+    lookahead: 1.50
+    velocity_scale: 1.0
+    throttle_gain: 0.037
+    corner_throttle_gain: 0.013
+    corner_steering_threshold: 0.65
+    kp_speed: 0.48
+    ki_speed: 0.045
+    integral_limit: 2.0
+    max_steering_rad: 0.61
+    path_direction: -1.0
+    steering_direction: -1.0
+    wheelbase: 0.33
+    amcl_stale_s: 2.0

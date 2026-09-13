@@ -28,7 +28,11 @@ services:
       LIDAR_HZ: "10"
       LIDAR_STRIDE: "4"
       PLAYGROUND_DATA_DIR: "/data"
+      PLAYGROUND_LOG_DIR: "/logs"
     volumes:
       # Persist saved maps + racelines across image rebuilds.
       - ./data:/data
+      # MPC tune logs (txt). Also overlay mpc_node so logging ships without a rebuild.
+      - ./logs:/logs
+      - ./gateway/autodrive_devkit/racing_algo/mpc_node.py:/home/autodrive_devkit/install/autodrive_roboracer/lib/python3.10/site-packages/racing_algo/mpc_node.py
     restart: unless-stopped

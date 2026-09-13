@@ -115,7 +115,7 @@ _MPC_PARAMS = {
     "throttle_gain", "corner_throttle_gain", "corner_steering_threshold",
     "kp_speed", "ki_speed", "integral_limit", "max_steering_rad",
     "velocity_scale", "steering_direction", "path_direction",
-    "max_speed", "q_pos", "q_yaw", "q_vel", "r_accel", "r_steer",
+    "max_speed", "horizon_steps", "q_pos", "q_yaw", "q_vel", "r_accel", "r_steer",
 }
 
 # Map-frame raceline trackers (AMCL + waypoint_file bringup).
@@ -187,6 +187,36 @@ ALGORITHMS = {
     },
 }
 
+
+def _tunable_params(algorithm: str, raw) -> Dict[str, float]:
+    """Keep only known numeric params for an algorithm."""
+    spec = ALGORITHMS.get(algorithm)
+    if spec is None or not isinstance(raw, dict):
+        return {}
+    allowed = spec["params"]
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        if k not in allowed:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv):
+            out[k] = fv
+    return out
+
+
+def _ros_cli_value(v) -> str:
+    """Format a ROS 2 `-p name:=value` so declared doubles stay doubles."""
+    if isinstance(v, str):
+        return v
+    f = float(v)
+    s = f"{f:.10f}".rstrip("0").rstrip(".")
+    if "." not in s:
+        s += ".0"
+    return s
+
 # ---------------------------------------------------------------------------
 # ROS node (runs in a background thread)
 # ---------------------------------------------------------------------------
@@ -211,6 +241,10 @@ class GatewayNode(Node):
         self.last_data_time: float = 0.0
         self._sim_was_connected = False
         self.session_epoch: int = 0
+        self._cmd_probe: Dict[str, tuple] = {}  # axis -> (rounded value, t0)
+        self._sim_rtt_ms: Optional[float] = None
+        self._lidar_hz: float = 0.0
+        self._last_lidar_mono: float = 0.0
 
         # Live SLAM map (PNG-encoded, seq-stamped for WS fan-out).
         self.map_frame: Optional[Dict] = None
@@ -222,6 +256,10 @@ class GatewayNode(Node):
         self.create_subscription(Odometry, f"{ns}/odom", self._on_odom, qos)
         self.create_subscription(Float32, f"{ns}/throttle", self._on_throttle, qos)
         self.create_subscription(Float32, f"{ns}/steering", self._on_steering, qos)
+        self.create_subscription(
+            Float32, f"{ns}/throttle_command", self._on_throttle_cmd, qos)
+        self.create_subscription(
+            Float32, f"{ns}/steering_command", self._on_steering_cmd, qos)
         self.create_subscription(Int32, f"{ns}/lap_count", self._on_lap_count, qos)
         self.create_subscription(Float32, f"{ns}/lap_time", self._on_lap_time, qos)
         self.create_subscription(Float32, f"{ns}/best_lap_time", self._on_best_lap, qos)
@@ -290,11 +328,21 @@ class GatewayNode(Node):
         self.last_data_time = time.monotonic()
 
     def _on_lidar(self, msg: LaserScan):
+        now = time.monotonic()
         ranges = list(msg.ranges[::LIDAR_STRIDE])
         cleaned = [
             (r if math.isfinite(r) else 0.0) for r in ranges
         ]
         with self.lock:
+            if self._last_lidar_mono > 0:
+                dt = now - self._last_lidar_mono
+                if 0.005 < dt < 1.0:
+                    hz = 1.0 / dt
+                    if self._lidar_hz <= 0:
+                        self._lidar_hz = hz
+                    else:
+                        self._lidar_hz = 0.2 * hz + 0.8 * self._lidar_hz
+            self._last_lidar_mono = now
             self.lidar = {
                 "angle_min": msg.angle_min,
                 "angle_increment": msg.angle_increment * LIDAR_STRIDE,
@@ -368,22 +416,64 @@ class GatewayNode(Node):
     def _on_throttle(self, msg: Float32):
         with self.lock:
             self.state["throttle"] = round(msg.data, 3)
+        self._match_cmd("throttle", msg.data)
 
     def _on_steering(self, msg: Float32):
         with self.lock:
             self.state["steering"] = round(msg.data, 3)
+        self._match_cmd("steering", msg.data)
+
+    def _on_throttle_cmd(self, msg: Float32):
+        self._note_cmd("throttle", msg.data)
+
+    def _on_steering_cmd(self, msg: Float32):
+        self._note_cmd("steering", msg.data)
+
+    def _note_cmd(self, axis: str, raw: float):
+        """Start a control-loop probe when the outgoing command changes."""
+        try:
+            val = round(float(raw), 3)
+        except (TypeError, ValueError):
+            return
+        now = time.monotonic()
+        with self.lock:
+            prev = self._cmd_probe.get(axis)
+            if prev is None or prev[0] != val:
+                self._cmd_probe[axis] = (val, now)
+
+    def _match_cmd(self, axis: str, raw: float):
+        """Complete a probe when actuator feedback matches the last command."""
+        try:
+            val = round(float(raw), 3)
+        except (TypeError, ValueError):
+            return
+        now = time.monotonic()
+        with self.lock:
+            probe = self._cmd_probe.get(axis)
+            if probe is None or probe[0] != val:
+                return
+            dt_ms = (now - probe[1]) * 1000.0
+            # Too fast is ROS loopback without Unity; too slow is a stale match.
+            if 4.0 <= dt_ms <= 2000.0:
+                if self._sim_rtt_ms is None:
+                    self._sim_rtt_ms = dt_ms
+                else:
+                    self._sim_rtt_ms = 0.35 * dt_ms + 0.65 * self._sim_rtt_ms
+            self._cmd_probe.pop(axis, None)
 
     def _on_lap_count(self, msg: Int32):
         with self.lock:
             self.state["lap_count"] = msg.data
 
     def _on_lap_time(self, msg: Float32):
+        v = float(msg.data)
         with self.lock:
-            self.state["lap_time"] = round(msg.data, 2)
+            self.state["lap_time"] = round(v, 2) if math.isfinite(v) else 0.0
 
     def _on_best_lap(self, msg: Float32):
+        v = float(msg.data)
         with self.lock:
-            self.state["best_lap_time"] = round(msg.data, 2)
+            self.state["best_lap_time"] = round(v, 2) if math.isfinite(v) else 0.0
 
     def _on_collisions(self, msg: Int32):
         with self.lock:
@@ -540,7 +630,26 @@ class GatewayNode(Node):
             self.algo_debug = None
             self._amcl_pose = None
             self._amcl_pose_time = 0.0
+            self._cmd_probe.clear()
+            self._sim_rtt_ms = None
+            self._lidar_hz = 0.0
+            self._last_lidar_mono = 0.0
             self.session_epoch += 1
+
+    def lag_snapshot(self) -> Dict:
+        """Control-loop + freshness stats for the UI."""
+        now = time.monotonic()
+        connected = self.sim_connected()
+        age_ms = ((now - self.last_data_time) * 1000.0
+                  if connected and self.last_data_time else None)
+        with self.lock:
+            rtt = self._sim_rtt_ms
+            hz = self._lidar_hz
+        return {
+            "sim_rtt_ms": round(rtt, 1) if rtt is not None else None,
+            "sim_age_ms": round(age_ms, 1) if age_ms is not None else None,
+            "sim_hz": round(hz, 1) if hz > 0.5 else None,
+        }
 
     def get_session_epoch(self) -> int:
         with self.lock:
@@ -691,6 +800,7 @@ class AlgoManager:
         self._proc: Optional[subprocess.Popen] = None
         self._name: Optional[str] = None
         self._raceline: Optional[str] = None
+        self._saved_params: Dict[str, Dict[str, float]] = {}
         self._lock = threading.Lock()
 
     @property
@@ -707,6 +817,27 @@ class AlgoManager:
                 return self._raceline
             return None
 
+    def saved_params(self, name: str) -> Dict[str, float]:
+        with self._lock:
+            return dict(self._saved_params.get(name, {}))
+
+    def remember_params(self, name: str, params: Optional[Dict] = None) -> None:
+        spec = ALGORITHMS.get(name)
+        if spec is None or not params:
+            return
+        allowed = spec["params"]
+        with self._lock:
+            slot = self._saved_params.setdefault(name, {})
+            for k, v in params.items():
+                if k not in allowed:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(fv):
+                    slot[k] = fv
+
     def start(self, name: str, extra_ros_params: Optional[Dict] = None,
               raceline: Optional[str] = None) -> Dict:
         if name not in ALGORITHMS:
@@ -715,7 +846,7 @@ class AlgoManager:
         if extra_ros_params:
             cmd.append("--ros-args")
             for k, v in extra_ros_params.items():
-                cmd += ["-p", f"{k}:={v}"]
+                cmd += ["-p", f"{k}:={_ros_cli_value(v)}"]
         with self._lock:
             self._stop_locked()
             if ros_node is not None:
@@ -811,6 +942,7 @@ def _authorized(token: Optional[str]) -> bool:
 
 @app.get("/health")
 def health():
+    lag = ros_node.lag_snapshot() if ros_node else None
     return {
         "ok": True,
         "sim_connected": ros_node.sim_connected() if ros_node else False,
@@ -818,6 +950,7 @@ def health():
         "slam_active": slam_mgr.active,
         "localize_active": localize_mgr.active,
         "opt_running": opt_mgr.running,
+        "lag": lag,
     }
 
 
@@ -904,25 +1037,14 @@ def _handle_slam_start(msg: Dict) -> Dict:
         return result
 
     if drive == "wall_follow":
-        started = algo.start("wall_follow")
+        preset = dict(MAPPING_PRESET)
+        preset.update(_tunable_params("wall_follow", msg.get("params")))
+        algo.remember_params("wall_follow", preset)
+        started = algo.start("wall_follow", extra_ros_params=preset)
         if not started["ok"]:
             slam_mgr.stop()
             return {"ok": False,
                     "reason": f"wall_follow failed: {started['reason']}"}
-        preset = dict(MAPPING_PRESET)
-        for k, v in (msg.get("params") or {}).items():
-            if k in ALGORITHMS["wall_follow"]["params"]:
-                preset[k] = float(v)
-
-        def apply_preset():
-            deadline = time.monotonic() + 6.0
-            while time.monotonic() < deadline:
-                r = ros_node.set_algo_params("wall_follow", preset)
-                if r.get("ok"):
-                    return
-                time.sleep(0.5)
-
-        threading.Thread(target=apply_preset, daemon=True).start()
     return {"ok": True, "drive": drive}
 
 
@@ -1013,6 +1135,11 @@ def _handle_raceline_save(msg: Dict) -> Dict:
 def _handle_start_algo(msg: Dict) -> Dict:
     """Blocking when starting map-race algos (AMCL bringup); run in executor."""
     name = msg.get("algorithm", "wall_follow")
+    incoming = _tunable_params(name, msg.get("params"))
+    merged = {**algo.saved_params(name), **incoming}
+    if merged:
+        algo.remember_params(name, merged)
+
     if name in MAP_CONTROLLER_ALGOS:
         if slam_mgr.active:
             return {"ok": False,
@@ -1042,10 +1169,11 @@ def _handle_start_algo(msg: Dict) -> Dict:
             return {"ok": False,
                     "reason": f"Initial pose seed failed: {seed.get('reason')}"}
 
+        extra = dict(merged)
+        extra["waypoint_file"] = store.raceline_csv_path(rl_name)
         started = algo.start(
             name,
-            extra_ros_params={
-                "waypoint_file": store.raceline_csv_path(rl_name)},
+            extra_ros_params=extra,
             raceline=rl_name,
         )
         if not started.get("ok"):
@@ -1054,7 +1182,7 @@ def _handle_start_algo(msg: Dict) -> Dict:
         return {"ok": True, "algorithm": name,
                 "raceline": rl_name, "map": map_name,
                 "localized": True}
-    return algo.start(name)
+    return algo.start(name, extra_ros_params=merged or None)
 
 
 def _handle_stop_algo() -> Dict:
@@ -1111,6 +1239,7 @@ async def ws_endpoint(ws: WebSocket):
             "slam": slam_mgr.status(),
             "localize": loc,
             "opt_running": opt_mgr.running,
+            "lag": ros_node.lag_snapshot(),
         }
 
     async def send(obj):
@@ -1145,6 +1274,7 @@ async def ws_endpoint(ws: WebSocket):
                     "type": "telemetry",
                     "t": round(now, 3),
                     "sim_connected": ros_node.sim_connected(),
+                    "lag": ros_node.lag_snapshot(),
                     **ros_node.snapshot(),
                 }
                 pe = ros_node.compute_pose_error(localize_mgr.map_name)
@@ -1217,6 +1347,8 @@ async def ws_endpoint(ws: WebSocket):
                     continue
                 result = await loop.run_in_executor(
                     None, ros_node.set_algo_params, algorithm, params)
+                if result.get("ok"):
+                    algo.remember_params(algorithm, params)
                 await ws.send_text(json.dumps({"type": "params_ack", **result}))
             elif mtype == "start_algo":
                 result = await loop.run_in_executor(

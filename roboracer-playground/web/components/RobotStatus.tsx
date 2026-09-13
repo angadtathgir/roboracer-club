@@ -63,7 +63,7 @@ export default function RobotStatus({ telemetry, metrics }: Props) {
   const rows: Record<StatusMetric, { label: string; node: ReactNode }> = {
     speed: {
       label: "Speed",
-      node: <span className="v">{telemetry.speed.toFixed(2)} m/s</span>,
+      node: <span className="v">{(telemetry.speed ?? 0).toFixed(2)} m/s</span>,
     },
     steering: {
       label: "Steering",
@@ -280,12 +280,12 @@ export default function RobotStatus({ telemetry, metrics }: Props) {
     },
     lap_time: {
       label: "Lap time",
-      node: <span className="v">{telemetry.lap_time.toFixed(2)} s</span>,
+      node: <span className="v">{(telemetry.lap_time ?? 0).toFixed(2)} s</span>,
     },
     best_lap: {
       label: "Best lap",
       node: (
-        <span className="v good">{telemetry.best_lap_time.toFixed(2)} s</span>
+        <span className="v good">{(telemetry.best_lap_time ?? 0).toFixed(2)} s</span>
       ),
     },
     collisions: {

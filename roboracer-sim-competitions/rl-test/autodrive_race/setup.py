@@ -1,0 +1,74 @@
+import os
+from glob import glob
+from pathlib import Path
+
+from setuptools import find_packages, setup
+
+package_name = "autodrive_race"
+BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
+
+
+def collect_glob(pattern: str):
+    return glob(pattern)
+
+
+def collect_tree(root: Path, install_prefix: str):
+    data_files = []
+    if not root.exists():
+        return data_files
+
+    for directory, _, filenames in os.walk(root):
+        if not filenames:
+            continue
+        destination = Path(install_prefix) / Path(directory).relative_to(root)
+        sources = [os.path.relpath(Path(directory) / filename, start=BASE_DIR) for filename in filenames]
+        data_files.append((str(destination), sources))
+    return data_files
+
+
+data_files = [
+    ("share/ament_index/resource_index/packages", [os.path.join("resource", package_name)]),
+    (os.path.join("share", package_name), ["package.xml"]),
+]
+for destination, pattern in [
+    (os.path.join("share", package_name, "launch"), "launch/*.launch.py"),
+    (os.path.join("share", package_name, "config"), "config/*.yaml"),
+    (os.path.join("share", package_name, "autodrive_race"), "autodrive_race/*.csv"),
+    (os.path.join("share", package_name, "checkpoints"), "checkpoints/*"),
+    (os.path.join("share", package_name, "best_model"), "best_model/*"),
+    (os.path.join("share", package_name, "logs"), "logs/*"),
+    (os.path.join("share", package_name, "maps"), "maps/*"),
+]:
+    matches = collect_glob(pattern)
+    if matches:
+        data_files.append((destination, matches))
+
+data_files.extend(
+    collect_tree(REPO_ROOT / "triton_model_repo", os.path.join("share", package_name, "triton_model_repo"))
+)
+
+setup(
+    name=package_name,
+    version="0.0.0",
+    packages=find_packages(exclude=["test"]),
+    data_files=data_files,
+    install_requires=["setuptools"],
+    zip_safe=True,
+    maintainer="root",
+    maintainer_email="root@todo.todo",
+    description="TODO: Package description",
+    license="TODO: License declaration",
+    tests_require=["pytest"],
+    entry_points={
+        "console_scripts": [
+            "ppo_training=autodrive_race.ppo_training:main",
+            "eval=autodrive_race.eval:main",
+            "final_test_training=autodrive_race.final_test_training:main",
+            "export_onnx=autodrive_race.export_onnx:main",
+            "benchmark_inference=autodrive_race.benchmark_inference:main",
+            "build_tensorrt=autodrive_race.build_tensorrt:main",
+            "triton_client=autodrive_race.triton_client:main",
+        ],
+    },
+)

@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { decodeOccB64 } from "@/lib/occupancyMap";
+import { algorithmSpec } from "@/lib/algorithms";
+import { loadAlgoParams } from "@/lib/algoParams";
 
 export interface AlgoDebug {
   algorithm: string;
@@ -75,6 +77,15 @@ export interface LocalizeStatus {
   age_s?: number;
 }
 
+export interface LagStats {
+  /** Command → matching actuator echo via Unity (control-loop RTT). */
+  sim_rtt_ms: number | null;
+  /** Age of the last lidar/odom packet at the gateway. */
+  sim_age_ms: number | null;
+  /** Smoothed LiDAR arrival rate at the gateway. */
+  sim_hz: number | null;
+}
+
 export interface GatewayStatus {
   wsConnected: boolean;
   simConnected: boolean;
@@ -83,6 +94,7 @@ export interface GatewayStatus {
   slam: SlamStatus;
   localize: LocalizeStatus;
   optRunning: boolean;
+  lag: LagStats;
 }
 
 export interface ParamsAck {
@@ -173,6 +185,35 @@ const DEFAULT_TELEMETRY: Telemetry = {
   algo_debug: null,
 };
 
+function numOr(v: unknown, fallback = 0): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
+/** Merge a WS telemetry frame onto defaults. The gateway omits NaN/Inf
+ *  fields (e.g. best_lap_time before any lap), which would otherwise wipe
+ *  DEFAULT_TELEMETRY and crash `.toFixed` in the status panel. */
+function asTelemetry(msg: Record<string, unknown>): Telemetry {
+  const pos = msg.position;
+  const position: [number, number, number] = Array.isArray(pos)
+    ? [numOr(pos[0]), numOr(pos[1]), numOr(pos[2])]
+    : DEFAULT_TELEMETRY.position;
+  return {
+    ...DEFAULT_TELEMETRY,
+    t: typeof msg.t === "number" && Number.isFinite(msg.t) ? msg.t : undefined,
+    position,
+    yaw: numOr(msg.yaw),
+    speed: numOr(msg.speed),
+    throttle: numOr(msg.throttle),
+    steering: numOr(msg.steering),
+    lap_count: numOr(msg.lap_count),
+    lap_time: numOr(msg.lap_time),
+    best_lap_time: numOr(msg.best_lap_time),
+    collision_count: numOr(msg.collision_count),
+    algo_debug: (msg.algo_debug as Telemetry["algo_debug"]) ?? null,
+    pose_error: (msg.pose_error as Telemetry["pose_error"]) ?? undefined,
+  };
+}
+
 const DEFAULT_SLAM: SlamStatus = {
   active: false,
   drive: null,
@@ -191,6 +232,24 @@ const DEFAULT_LOCALIZE: LocalizeStatus = {
   pose: null,
 };
 
+const EMPTY_LAG: LagStats = {
+  sim_rtt_ms: null,
+  sim_age_ms: null,
+  sim_hz: null,
+};
+
+function asLag(raw: unknown): LagStats {
+  if (!raw || typeof raw !== "object") return EMPTY_LAG;
+  const o = raw as Record<string, unknown>;
+  const n = (k: string): number | null =>
+    typeof o[k] === "number" && Number.isFinite(o[k]) ? (o[k] as number) : null;
+  return {
+    sim_rtt_ms: n("sim_rtt_ms"),
+    sim_age_ms: n("sim_age_ms"),
+    sim_hz: n("sim_hz"),
+  };
+}
+
 const DEFAULT_STATUS: GatewayStatus = {
   wsConnected: false,
   simConnected: false,
@@ -199,6 +258,7 @@ const DEFAULT_STATUS: GatewayStatus = {
   slam: DEFAULT_SLAM,
   localize: DEFAULT_LOCALIZE,
   optRunning: false,
+  lag: EMPTY_LAG,
 };
 
 /** Derive the REST base (http[s]://host) from the gateway WS URL. */
@@ -235,8 +295,10 @@ export function useGateway(url: string, token: string) {
 
   const trailRef = useRef<[number, number][]>([]);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pingTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const simWasConnected = useRef(false);
   const ackCounter = useRef(0);
+  const [uiRttMs, setUiRttMs] = useState<number | null>(null);
 
   const clearFrontendSession = useCallback(() => {
     trailRef.current = [];
@@ -254,6 +316,10 @@ export function useGateway(url: string, token: string) {
     } catch {
       /* ignore */
     }
+    if (pingTimer.current) {
+      clearInterval(pingTimer.current);
+      pingTimer.current = null;
+    }
     const full = token ? `${url}?token=${encodeURIComponent(token)}` : url;
     let ws: WebSocket;
     try {
@@ -264,16 +330,36 @@ export function useGateway(url: string, token: string) {
     }
     wsRef.current = ws;
 
+    const stopPing = () => {
+      if (pingTimer.current) {
+        clearInterval(pingTimer.current);
+        pingTimer.current = null;
+      }
+    };
+
     const stamp = <T extends Record<string, unknown>>(msg: T): Ack => ({
       ok: Boolean(msg.ok),
       ...msg,
       n: ++ackCounter.current,
     });
 
-    ws.onopen = () => setStatus((s) => ({ ...s, wsConnected: true }));
+    ws.onopen = () => {
+      setStatus((s) => ({ ...s, wsConnected: true }));
+      setUiRttMs(null);
+      const beat = () => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping", t: performance.now() }));
+        }
+      };
+      beat();
+      stopPing();
+      pingTimer.current = setInterval(beat, 1000);
+    };
     ws.onclose = () => {
       // Stale close from a replaced socket must not wipe the new session.
       if (wsRef.current !== ws) return;
+      stopPing();
+      setUiRttMs(null);
       simWasConnected.current = false;
       setStatus({ ...DEFAULT_STATUS });
       clearFrontendSession();
@@ -295,21 +381,31 @@ export function useGateway(url: string, token: string) {
           // Per-frame flag (preferred): unlock odom as soon as the sim is live,
           // without waiting for the 1 Hz status tick. Never paint DEFAULT zeros
           // here — that pinned the green triangle at the origin on startup.
-          if (typeof msg.sim_connected === "boolean") {
-            const connected = Boolean(msg.sim_connected);
-            if (connected !== simWasConnected.current) {
-              const wasConnected = simWasConnected.current;
+          const nextLag = msg.lag ? asLag(msg.lag) : null;
+          if (typeof msg.sim_connected === "boolean" || nextLag) {
+            const connected =
+              typeof msg.sim_connected === "boolean"
+                ? Boolean(msg.sim_connected)
+                : simWasConnected.current;
+            const wasConnected = simWasConnected.current;
+            if (typeof msg.sim_connected === "boolean") {
               simWasConnected.current = connected;
-              setStatus((s) => ({ ...s, simConnected: connected }));
-              if (wasConnected && !connected) {
-                clearFrontendSession();
-              }
+            }
+            setStatus((s) => ({
+              ...s,
+              ...(typeof msg.sim_connected === "boolean"
+                ? { simConnected: connected }
+                : {}),
+              ...(nextLag ? { lag: nextLag } : {}),
+            }));
+            if (wasConnected && !connected) {
+              clearFrontendSession();
             }
           }
           if (!simWasConnected.current) {
             break;
           }
-          const t = msg as unknown as Telemetry;
+          const t = asTelemetry(msg);
           setTelemetry(t);
           const [x, y] = t.position;
           const prev = trailRef.current;
@@ -343,10 +439,20 @@ export function useGateway(url: string, token: string) {
               ...((msg.localize as LocalizeStatus) ?? {}),
             },
             optRunning: Boolean(msg.opt_running),
+            lag: msg.lag ? asLag(msg.lag) : s.lag,
           }));
           // Backend signals a full wipe, or we observe the disconnect edge.
           if (msg.session_reset || (wasConnected && !simConnected)) {
             clearFrontendSession();
+          }
+          break;
+        }
+        case "pong": {
+          if (typeof msg.t === "number" && Number.isFinite(msg.t)) {
+            const rtt = performance.now() - msg.t;
+            if (rtt >= 0 && rtt < 10000) {
+              setUiRttMs((prev) => (prev == null ? rtt : prev * 0.6 + rtt * 0.4));
+            }
           }
           break;
         }
@@ -426,6 +532,10 @@ export function useGateway(url: string, token: string) {
     connect();
     return () => {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (pingTimer.current) {
+        clearInterval(pingTimer.current);
+        pingTimer.current = null;
+      }
       const ws = wsRef.current;
       wsRef.current = null;
       ws?.close();
@@ -445,7 +555,12 @@ export function useGateway(url: string, token: string) {
   );
   const startAlgo = useCallback(
     (algorithm: string, raceline?: string) =>
-      send({ type: "start_algo", algorithm, raceline }),
+      send({
+        type: "start_algo",
+        algorithm,
+        raceline,
+        params: loadAlgoParams(algorithmSpec(algorithm)),
+      }),
     [send]
   );
   const stopAlgo = useCallback(() => send({ type: "stop_algo" }), [send]);
@@ -525,6 +640,7 @@ export function useGateway(url: string, token: string) {
     trail,
     lastAck,
     sessionEpoch,
+    uiRttMs,
     mapFrame,
     optEvent,
     racelineData,

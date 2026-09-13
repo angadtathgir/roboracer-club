@@ -1,0 +1,24 @@
+# Playground MPC slider defaults (web/lib/algorithms.ts, id: "mpc").
+# Loaded by race.launch.py when controller:=mpc.
+# Default race controller is pp_backup; this file is unused unless you swap.
+
+mpc_node:
+  ros__parameters:
+    velocity_scale: 1.0
+    max_speed: 6.0
+    horizon_steps: 6.0
+    q_pos: 13.5
+    q_yaw: 13.0
+    q_vel: 5.5
+    r_accel: 0.01
+    r_steer: 100.0
+    throttle_gain: 0.043
+    corner_throttle_gain: 0.025
+    corner_steering_threshold: 0.6
+    kp_speed: 0.20
+    ki_speed: 0.05
+    integral_limit: 2.0
+    max_steering_rad: 0.58
+    path_direction: -1.0
+    steering_direction: -1.0
+    amcl_stale_s: 2.0

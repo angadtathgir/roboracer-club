@@ -3,12 +3,13 @@
 Kinematic MPC for the AutoDRIVE RoboRacer (playground edition).
 
 Follows a raceline CSV (s, x, y, theta, velocity) in the map frame.
-Pose for control comes from /amcl_pose; odom is used only for speed.
+Pose and speed for control come from /amcl_pose only (no odom).
 """
 import csv
 import math
 import os
 import time
+from datetime import datetime, timezone
 
 import numpy as np
 import rclpy
@@ -16,7 +17,6 @@ from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, Float32MultiArray
 
 from racing_algo.kinematic_mpc import KMPCPlanner, MpcConfig
@@ -38,6 +38,14 @@ DEFAULT_WAYPOINT_FILE = os.path.join(
 
 AMCL_STALE_S = 2.0
 
+LOG_COLUMNS = (
+    "t", "status", "solve_ms", "s", "x", "y", "yaw",
+    "lat_err", "heading_err", "speed", "target_v", "speed_err",
+    "steer_rad", "steer_norm", "steer_sat", "throttle",
+    "horizon", "q_pos", "q_yaw", "q_vel", "r_steer", "r_accel",
+    "vmax", "vscale",
+)
+
 
 class MpcNode(Node):
     """Kinematic MPC driven by particle-filter pose (map frame)."""
@@ -57,6 +65,7 @@ class MpcNode(Node):
         self.declare_parameter('steering_direction', -1.0)
         self.declare_parameter('path_direction', -1.0)
         self.declare_parameter('max_speed', 6.0)
+        self.declare_parameter('horizon_steps', 8.0)
         self.declare_parameter('q_pos', 13.5)
         self.declare_parameter('q_yaw', 13.0)
         self.declare_parameter('q_vel', 5.5)
@@ -75,17 +84,25 @@ class MpcNode(Node):
         self._last_control_time = None
         self._amcl_pose = None
         self._amcl_stamp_mono = 0.0
+        self._prev_amcl_s = None
         self._warned_stale = False
         self._last_steer = 0.0
 
         self.planner = self._make_planner()
+        self._log_fp = None
+        self._log_t0 = time.monotonic()
+        self._log_n = 0
+        self._log_qp_fail = 0
+        self._log_sum_lat = 0.0
+        self._log_sum_head = 0.0
+        self._log_sum_sat = 0.0
+        self._log_sum_speed = 0.0
+        self._log_max_lat = 0.0
+        self._open_log()
 
         self.amcl_sub = self.create_subscription(
             PoseWithCovarianceStamped, '/amcl_pose',
             self.amcl_callback, 10)
-        self.odom_sub = self.create_subscription(
-            Odometry, '/autodrive/roboracer_1/odom',
-            self.odom_callback, 10)
 
         self.throttle_pub = self.create_publisher(
             Float32, '/autodrive/roboracer_1/throttle_command', 10)
@@ -96,7 +113,8 @@ class MpcNode(Node):
 
         self.get_logger().info(
             f"MPC initialized with {len(self.raw_waypoints)} waypoints "
-            f"(pose=/amcl_pose, path_direction={self.path_direction})")
+            f"(pose+speed=/amcl_pose, path_direction={self.path_direction}"
+            f", log={getattr(self._log_fp, 'name', None)})")
 
     def _load_params(self):
         self.max_steering_rad = float(
@@ -117,6 +135,7 @@ class MpcNode(Node):
         self.path_direction = float(
             self.get_parameter('path_direction').value)
         self.max_speed = float(self.get_parameter('max_speed').value)
+        self.horizon_steps = float(self.get_parameter('horizon_steps').value)
         self.q_pos = float(self.get_parameter('q_pos').value)
         self.q_yaw = float(self.get_parameter('q_yaw').value)
         self.q_vel = float(self.get_parameter('q_vel').value)
@@ -127,12 +146,13 @@ class MpcNode(Node):
     def _cost_names(self):
         return (
             'q_pos', 'q_yaw', 'q_vel', 'r_accel', 'r_steer',
-            'max_speed', 'max_steering_rad',
+            'max_speed', 'max_steering_rad', 'horizon_steps',
         )
 
     def _make_planner(self) -> KMPCPlanner:
         steer_lim = max(0.05, abs(self.max_steering_rad))
         cfg = MpcConfig(
+            horizon_steps=max(2, int(round(self.horizon_steps))),
             Rk=np.diag([self.r_accel, self.r_steer]),
             Rdk=np.diag([self.r_accel, self.r_steer]),
             Qk=np.diag([self.q_pos, self.q_pos, self.q_vel, self.q_yaw]),
@@ -173,11 +193,164 @@ class MpcNode(Node):
     def _refresh_planner_waypoints(self):
         self.planner.waypoints = self._mpc_waypoints()
 
+    def _log_dir(self) -> str:
+        env = os.environ.get("PLAYGROUND_LOG_DIR")
+        if env:
+            return env
+        data = os.environ.get("PLAYGROUND_DATA_DIR", "/data")
+        return os.path.join(data, "logs")
+
+    def _param_snapshot(self) -> str:
+        return (
+            f"horizon_steps={int(round(self.horizon_steps))} "
+            f"q_pos={self.q_pos:.3g} q_yaw={self.q_yaw:.3g} "
+            f"q_vel={self.q_vel:.3g} r_steer={self.r_steer:.3g} "
+            f"r_accel={self.r_accel:.3g} max_speed={self.max_speed:.3g} "
+            f"velocity_scale={self.velocity_scale:.3g} "
+            f"max_steering_rad={self.max_steering_rad:.3g} "
+            f"path_direction={self.path_direction:.0f} "
+            f"steering_direction={self.steering_direction:.0f}"
+        )
+
+    def _open_log(self):
+        log_dir = self._log_dir()
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(log_dir, f"mpc_{stamp}.txt")
+            self._log_fp = open(path, "w", buffering=1)
+            self._log_fp.write("# MPC playground tune log\n")
+            self._log_fp.write(
+                f"# started_utc={datetime.now(timezone.utc).isoformat()}\n")
+            self._log_fp.write(f"# {self._param_snapshot()}\n")
+            self._log_fp.write("# " + "\t".join(LOG_COLUMNS) + "\n")
+            self._log_fp.write("\t".join(LOG_COLUMNS) + "\n")
+        except OSError as e:
+            self._log_fp = None
+            self.get_logger().error(f"MPC log file not opened: {e}")
+
+    def _close_log(self):
+        if self._log_fp is None:
+            return
+        try:
+            if self._log_n:
+                self._write_summary("final")
+            self._log_fp.close()
+        except OSError:
+            pass
+        self._log_fp = None
+
+    def _write_summary(self, tag: str):
+        if self._log_fp is None or self._log_n <= 0:
+            return
+        n = float(self._log_n)
+        self._log_fp.write(
+            f"# summary {tag} n={self._log_n} qp_fail={self._log_qp_fail} "
+            f"mean_lat={self._log_sum_lat / n:.3f} "
+            f"max_lat={self._log_max_lat:.3f} "
+            f"mean_heading={self._log_sum_head / n:.3f} "
+            f"mean_steer_sat={self._log_sum_sat / n:.2f} "
+            f"mean_speed={self._log_sum_speed / n:.2f}\n"
+        )
+
+    def _path_errors(self, x, y, yaw, px, py):
+        n = len(self.raw_waypoints)
+        if n < 2 or self.last_closest_idx is None:
+            return 0.0, 0.0
+        idx = int(self.last_closest_idx)
+        p1 = self.raw_waypoints[idx, 1:3]
+        p2 = self.raw_waypoints[(idx + 1) % n, 1:3]
+        seg = p2 - p1
+        if self.path_direction < 0:
+            seg = -seg
+        seglen = float(np.hypot(seg[0], seg[1]))
+        if seglen < 1e-6:
+            return 0.0, 0.0
+        nx, ny = -float(seg[1]) / seglen, float(seg[0]) / seglen
+        lat = (x - px) * nx + (y - py) * ny
+        path_yaw = math.atan2(float(seg[1]), float(seg[0]))
+        heading = math.atan2(
+            math.sin(yaw - path_yaw), math.cos(yaw - path_yaw))
+        return float(lat), float(heading)
+
+    def _log_tick(
+            self, *, status, solve_ms, s, x, y, yaw, lat_err, heading_err,
+            speed, target_v, steer_rad, steer_norm, throttle):
+        if self._log_fp is None:
+            return
+        sat = 0.0
+        if abs(self.max_steering_rad) > 1e-6:
+            sat = min(1.0, abs(steer_rad) / abs(self.max_steering_rad))
+        row = {
+            "t": time.monotonic() - self._log_t0,
+            "status": status,
+            "solve_ms": solve_ms,
+            "s": s,
+            "x": x,
+            "y": y,
+            "yaw": yaw,
+            "lat_err": lat_err,
+            "heading_err": heading_err,
+            "speed": speed,
+            "target_v": target_v,
+            "speed_err": target_v - speed,
+            "steer_rad": steer_rad,
+            "steer_norm": steer_norm,
+            "steer_sat": sat,
+            "throttle": throttle,
+            "horizon": int(round(self.horizon_steps)),
+            "q_pos": self.q_pos,
+            "q_yaw": self.q_yaw,
+            "q_vel": self.q_vel,
+            "r_steer": self.r_steer,
+            "r_accel": self.r_accel,
+            "vmax": self.max_speed,
+            "vscale": self.velocity_scale,
+        }
+        fmt = {
+            "t": ".3f", "solve_ms": ".2f", "s": ".3f", "x": ".3f", "y": ".3f",
+            "yaw": ".3f", "lat_err": ".4f", "heading_err": ".4f",
+            "speed": ".3f", "target_v": ".3f", "speed_err": ".3f",
+            "steer_rad": ".4f", "steer_norm": ".4f", "steer_sat": ".3f",
+            "throttle": ".3f", "horizon": "d", "q_pos": ".3g", "q_yaw": ".3g",
+            "q_vel": ".3g", "r_steer": ".3g", "r_accel": ".3g",
+            "vmax": ".3g", "vscale": ".3g",
+        }
+        parts = []
+        for col in LOG_COLUMNS:
+            val = row[col]
+            if col == "status":
+                parts.append(str(val))
+            else:
+                parts.append(format(val, fmt[col]))
+        self._log_fp.write("\t".join(parts) + "\n")
+
+        if status == "qp_fail":
+            self._log_qp_fail += 1
+        self._log_n += 1
+        self._log_sum_lat += abs(lat_err)
+        self._log_sum_head += abs(heading_err)
+        self._log_sum_sat += sat
+        self._log_sum_speed += abs(speed)
+        self._log_max_lat = max(self._log_max_lat, abs(lat_err))
+        if self._log_n % 40 == 0:
+            self._write_summary("rolling")
+
+    def destroy_node(self):
+        self._close_log()
+        super().destroy_node()
+
     def _on_set_parameters(self, params):
         for p in params:
             if p.name == 'max_steering_rad' and float(p.value) <= 0.0:
                 return SetParametersResult(
                     successful=False, reason='max_steering_rad must be > 0')
+            if p.name == 'horizon_steps':
+                steps = int(round(float(p.value)))
+                if steps < 2 or steps > 30:
+                    return SetParametersResult(
+                        successful=False,
+                        reason='horizon_steps must be between 2 and 30')
             if p.name in (
                     'throttle_gain', 'corner_throttle_gain', 'velocity_scale',
                     'kp_speed', 'ki_speed', 'integral_limit', 'amcl_stale_s',
@@ -217,6 +390,9 @@ class MpcNode(Node):
             self.planner = self._make_planner()
         elif refresh_wps:
             self._refresh_planner_waypoints()
+        if self._log_fp is not None:
+            names = ", ".join(p.name for p in params)
+            self._log_fp.write(f"# PARAM {names} -> {self._param_snapshot()}\n")
         return SetParametersResult(successful=True)
 
     def _load_waypoints(self, path: str) -> np.ndarray:
@@ -323,10 +499,30 @@ class MpcNode(Node):
     def _publish_hold(self):
         self.throttle_pub.publish(Float32(data=0.0))
         self.steering_pub.publish(Float32(data=0.0))
+        self._prev_amcl_s = None
 
-    def odom_callback(self, msg: Odometry):
-        tw = msg.twist.twist.linear
-        self.speed = math.sqrt(tw.x ** 2 + tw.y ** 2)
+    def _speed_from_amcl(self, s, t_s):
+        """Along-track speed from successive /amcl_pose projections on the raceline."""
+        prev = self._prev_amcl_s
+        self._prev_amcl_s = (s, t_s)
+        if prev is None:
+            return
+        dt = t_s - prev[1]
+        if dt < 1e-3 or dt > 0.5:
+            return
+        ds = s - prev[0]
+        if len(self.raw_waypoints) > 0:
+            length = float(self.raw_waypoints[-1, 0])
+            if length > 1e-3:
+                ds = (ds + 0.5 * length) % length - 0.5 * length
+        inst = abs(ds) / dt
+        cap = max(self.max_speed, 0.5) * 1.25
+        inst = min(inst, cap)
+        # Frozen/lagged AMCL pose looks like v=0; do not drag speed to zero
+        # in one tick or the throttle PI coasts the real car to a stop.
+        if self.speed > 1.0 and inst < 0.3 * self.speed:
+            return
+        self.speed = 0.6 * self.speed + 0.4 * inst
 
     def amcl_callback(self, msg: PoseWithCovarianceStamped):
         self._amcl_pose = msg
@@ -345,6 +541,8 @@ class MpcNode(Node):
                     "Particle filter pose stale/missing; holding zero "
                     "throttle/steer (no odom fallback for control)")
                 self._warned_stale = True
+                if self._log_fp is not None:
+                    self._log_fp.write("# WARN amcl pose stale; holding\n")
             self._publish_hold()
             return
 
@@ -354,8 +552,10 @@ class MpcNode(Node):
         q = pose.orientation
         curr_yaw = self.euler_from_quaternion(q.x, q.y, q.z, q.w)
         dt = self._control_dt()
-
-        s_curr, _, _ = self.get_frenet_s(curr_x, curr_y)
+        s_curr, px, py = self.get_frenet_s(curr_x, curr_y)
+        lat_err, heading_err = self._path_errors(
+            curr_x, curr_y, curr_yaw, px, py)
+        self._speed_from_amcl(s_curr, time.monotonic())
 
         state = np.array([
             curr_x, curr_y, self._last_steer, self.speed,
@@ -367,7 +567,12 @@ class MpcNode(Node):
         solve_ms = (time.perf_counter() - t0) * 1000.0
 
         if steer is None or target_v is None:
-            self._publish_hold()
+            self._log_tick(
+                status="qp_fail", solve_ms=solve_ms, s=s_curr,
+                x=curr_x, y=curr_y, yaw=curr_yaw,
+                lat_err=lat_err, heading_err=heading_err,
+                speed=self.speed, target_v=self.speed,
+                steer_rad=self._last_steer, steer_norm=0.0, throttle=0.0)
             return
 
         steer = max(-self.max_steering_rad, min(self.max_steering_rad, steer))
@@ -381,6 +586,14 @@ class MpcNode(Node):
         throttle = self.compute_throttle(
             target_v, self.speed, norm_steering, dt)
         self.throttle_pub.publish(Float32(data=float(throttle)))
+
+        self._log_tick(
+            status="ok", solve_ms=solve_ms, s=s_curr,
+            x=curr_x, y=curr_y, yaw=curr_yaw,
+            lat_err=lat_err, heading_err=heading_err,
+            speed=self.speed, target_v=target_v,
+            steer_rad=steer, steer_norm=float(-norm_steering),
+            throttle=throttle)
 
         ref_x = self.planner.last_ref_x
         ref_y = self.planner.last_ref_y

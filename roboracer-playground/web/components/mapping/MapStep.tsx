@@ -5,6 +5,7 @@ import type { Gateway } from "@/lib/useGateway";
 import type { Mapping } from "@/lib/useMapping";
 import { suggestedMapName } from "@/lib/useMapping";
 import { algorithmSpec } from "@/lib/algorithms";
+import { loadAlgoParams } from "@/lib/algoParams";
 import ParamsPanel from "@/components/ParamsPanel";
 import NameModal from "./NameModal";
 import SliderRow from "./SliderRow";
@@ -19,9 +20,6 @@ export default function MapStep({ gw, lab }: Props) {
   const slam = status.slam;
   const wallSpec = useMemo(() => algorithmSpec("wall_follow"), []);
   const [drive, setDrive] = useState<"wall_follow" | "manual">("wall_follow");
-  const [wfParams, setWfParams] = useState<Record<string, number>>(() =>
-    Object.fromEntries(wallSpec.params.map((p) => [p.name, p.default]))
-  );
   const [showSave, setShowSave] = useState(false);
   const [savePending, setSavePending] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -75,7 +73,9 @@ export default function MapStep({ gw, lab }: Props) {
                 lab.setViewedMap(null);
                 gw.slamStart(
                   drive,
-                  drive === "wall_follow" ? wfParams : undefined
+                  drive === "wall_follow"
+                    ? loadAlgoParams(wallSpec)
+                    : undefined
                 );
               }}
             >
@@ -128,12 +128,10 @@ export default function MapStep({ gw, lab }: Props) {
         <section className="step-section">
           <ParamsPanel
             algorithm={wallSpec}
-            onSetParams={(p) => {
-              setWfParams((prev) => ({ ...prev, ...p }));
-              if (wallFollowMapping) gw.setParams(p);
-            }}
+            onSetParams={gw.setParams}
             lastAck={wallFollowMapping ? gw.lastAck : null}
             disabled={false}
+            live={wallFollowMapping}
           />
         </section>
       )}

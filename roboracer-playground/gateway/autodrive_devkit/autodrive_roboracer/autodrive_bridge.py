@@ -46,8 +46,6 @@ from geventwebsocket.handler import WebSocketHandler # Handler for WebSocket mes
 import socketio # Socket.IO realtime client and server
 import numpy as np # Scientific computing
 import base64 # Base64 binary-to-text encoding/decoding scheme
-from io import BytesIO # Manipulate bytes data in memory
-from PIL import Image # Python Imaging Library's (PIL's) Image module
 import gzip # Inbuilt module to compress and decompress data and files
 import autodrive_roboracer.config as config # AutoDRIVE Ecosystem ROS 2 configuration for RoboRacer vehicle
 
@@ -332,8 +330,11 @@ def bridge(sid, data):
         # LIDAR
         autodrive.lidar_scan_rate = float(data["V1 LIDAR Scan Rate"])
         autodrive.lidar_range_array = np.fromstring(gzip.decompress(base64.b64decode(data["V1 LIDAR Range Array"])).decode('utf-8'), sep='\n')
-        # Cameras
-        autodrive.front_camera_image = np.asarray(Image.open(BytesIO(base64.b64decode(data["V1 Front Camera Image"]))))
+        # Cameras: Unity still puts a JPEG on the Socket.IO payload (we cannot
+        # stop that), but JPEG inflate + ROS Image publish is the hot path on
+        # the Fly VM. The playground UI never uses /front_camera. Skip so
+        # lidar and throttle/steer stay timely when the sim is foregrounded
+        # at full rate (backgrounded Unity often runs slower, which hid this).
         # Lap data
         autodrive.lap_count = int(float(data["V1 Lap Count"]))
         autodrive.lap_time = float(data["V1 Lap Time"])
@@ -355,8 +356,6 @@ def bridge(sid, data):
         broadcast_transforms(transform_broadcaster, autodrive)
         # LIDAR
         publish_lidar_scan(autodrive.lidar_scan_rate, autodrive.lidar_range_array, autodrive.lidar_intensity_array)
-        # Cameras
-        publish_camera_images(autodrive.front_camera_image)
         # Lap data
         publish_lap_count_data(autodrive.lap_count)
         publish_lap_time_data(autodrive.lap_time)

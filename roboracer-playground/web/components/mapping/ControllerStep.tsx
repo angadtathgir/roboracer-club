@@ -154,7 +154,8 @@ export default function ControllerStep({ gw, lab }: Props) {
           algorithm={spec}
           onSetParams={gw.setParams}
           lastAck={gw.lastAck}
-          disabled={!racing || !status.wsConnected}
+          disabled={!status.wsConnected}
+          live={racing && status.wsConnected}
         />
       </section>
 
@@ -184,7 +185,7 @@ export default function ControllerStep({ gw, lab }: Props) {
           {racing && (
             <div className="lap-row">
               <span>{telemetry.lap_count + 1}</span>
-              <span className="v">{telemetry.lap_time.toFixed(2)} s</span>
+              <span className="v">{(telemetry.lap_time ?? 0).toFixed(2)} s</span>
               <span>running</span>
             </div>
           )}

@@ -409,6 +409,15 @@ export const ALGORITHMS: AlgorithmSpec[] = [
         default: 6.0,
       },
       {
+        name: "horizon_steps",
+        label: "Horizon steps",
+        info: "Look-ahead length in 0.1 s steps. Longer sees further around corners; the QP is slower.",
+        min: 2,
+        max: 20,
+        step: 1,
+        default: 8,
+      },
+      {
         name: "q_pos",
         label: "Q position",
         info: "State cost on (x, y) tracking error. Higher = sticks closer to the raceline.",
