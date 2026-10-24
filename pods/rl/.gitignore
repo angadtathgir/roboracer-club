@@ -1,0 +1,6 @@
+*.zip
+*.pt
+*.pth
+tb/
+runs/
+wandb/
